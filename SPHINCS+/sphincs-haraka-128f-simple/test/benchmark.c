@@ -4,10 +4,10 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/utsname.h>  // 系统内核信息
-#include <sys/sysinfo.h>  // 内存信息
-#include <string.h>       // 字符串处理
-#include <stdint.h>       // uint64_t 类型
+#include <sys/utsname.h>
+#include <sys/sysinfo.h>
+#include <string.h>
+#include <stdint.h>
 #include <stddef.h>
 
 #include "../api.h"
@@ -20,39 +20,17 @@
 #define NTESTS 10
 #define TEST_ROUNDS 20
 
-// 架构判断宏
-#if defined(__x86_64__) || defined(i386)
-#define ARCH_X86 1
-#elif defined(__aarch64__) || defined(__arm__)
-#define ARCH_ARM 1
-#else
-#define ARCH_UNKNOWN 1
-#endif
+// 明确指定架构为Cortex-A53（Arm64/aarch64）
+#define ARCH_CORTEX_A53 "Cortex-A53 (aarch64/armv8-a)"
 
 int compare_uint64(const void *a, const void *b) {
     uint64_t va = *(const uint64_t *)a, vb = *(const uint64_t *)b;
     return (va > vb) - (va < vb);
 }
 
+// 虚拟平台固定频率：1.2 GHz = 1200.0 MHz
 static double get_cpu_freq(void) {
-    FILE *fp = fopen("/proc/cpuinfo", "r");
-    if (fp == NULL) return -1.0;
-    char buf[256];
-    double freq = -1.0;
-    while (fgets(buf, sizeof(buf), fp) != NULL) {
-        // 兼容x86的cpu MHz和Arm的BogoMIPS（BogoMIPS≈2×CPU频率MHz）
-        if (strstr(buf, "cpu MHz") != NULL) {
-            sscanf(buf, "cpu MHz\t: %lf", &freq);
-            break;
-        } else if (strstr(buf, "BogoMIPS") != NULL && freq < 0) {
-            double bogomips;
-            if (sscanf(buf, "BogoMIPS\t: %lf", &bogomips) == 1) {
-                freq = bogomips / 2.0;  // 近似换算CPU频率
-            }
-        }
-    }
-    fclose(fp);
-    return freq;
+    return 1200.0;
 }
 
 static double get_total_memory(void) {
@@ -66,28 +44,8 @@ static const char *get_compiler_name(void) {
     return "GCC";
 #elif defined(__clang__)
     return "Clang";
-#elif defined(_MSC_VER)
-    return "MSVC";
 #else
     return "Unknown";
-#endif
-}
-
-static const char *get_arch_name(void) {
-#ifdef ARCH_X86
-#if defined(__x86_64__)
-    return "x86_64";
-#else
-    return "x86_32";
-#endif
-#elif defined ARCH_ARM
-#if defined(__aarch64__)
-    return "ARM64 (aarch64)";
-#else
-    return "ARM32 (armv7+)";
-#endif
-#else
-    return "Unknown Architecture";
 #endif
 }
 
@@ -104,9 +62,9 @@ static void print_platform_info(double *cpu_freq_out) {
     printf("                      测试平台信息                            \n");
     printf("=============================================================\n");
     printf("操作系统内核版本: %s %s\n", un.sysname, un.release);
-    printf("架构类型        : %s\n", get_arch_name());
+    printf("架构类型        : %s\n", ARCH_CORTEX_A53);
     printf("编译器          : %s %s\n", get_compiler_name(), __VERSION__);
-    printf("CPU基础频率     : %.2f MHz\n", (cpu_freq >= 0) ? cpu_freq : -1.0);
+    printf("CPU基础频率     : %.2f MHz\n", cpu_freq);
     printf("系统总内存      : %.2f GB\n", (total_mem >= 0) ? total_mem : -1.0);
     printf("测试次数        : %d 次\n", TEST_ROUNDS);
     printf("=============================================================\n\n");
@@ -152,49 +110,19 @@ static void delta(unsigned long long *l, size_t llen) {
     }
 }
 
-// Arm架构CPU周期读取（支持aarch64和armv7+）
-#if defined(ARCH_ARM)
-static inline void enable_pmccntr(void) {
-    uint32_t val;
-    // 读取PMCR寄存器，启用计数器
-    __asm__ volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(val));
-    val |= 1;  // 置位EN位，启用计数器
-    __asm__ volatile("mcr p15, 0, %0, c9, c12, 0" : : "r"(val));
-    // 清除计数器
-    __asm__ volatile("mcr p15, 0, %0, c9, c13, 0" : : "r"(0));
-}
-
+// 使用 CLOCK_MONOTONIC + 已知频率模拟 CPU 周期（适用于无 PMU 的虚拟平台）
 static unsigned long long cpucycles(void) {
-    static int initialized = 0;
-    if (!initialized) {
-        enable_pmccntr();
-        initialized = 1;
+    static double cpu_freq_mhz = -1.0;
+    if (cpu_freq_mhz < 0) {
+        cpu_freq_mhz = get_cpu_freq(); // 1200.0 MHz
     }
-    unsigned long long cycles;
-#if defined(__aarch64__)
-    // Arm64读取PMCCNTR_EL0寄存器
-    __asm__ volatile("mrs %0, pmccntr_el0" : "=r"(cycles));
-#else
-    // Arm32读取PMCCNTR寄存器
-    uint32_t lo, hi;
-    __asm__ volatile(
-        "mrc p15, 0, %0, c9, c13, 0\n"  // 读取低32位
-        "mrc p15, 0, %1, c9, c13, 1"    // 读取高32位（若支持）
-        : "=r"(lo), "=r"(hi)
-    );
-    cycles = ((unsigned long long)hi << 32) | lo;
-#endif
-    return cycles;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // 转换为微秒：秒*1e6 + 纳秒/1e3
+    double microseconds = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+    // cycles = microseconds * MHz
+    return (unsigned long long)(microseconds * cpu_freq_mhz);
 }
-#elif defined(ARCH_X86)
-// 保留原x86实现，兼容双向编译
-static unsigned long long cpucycles(void) {
-    unsigned long long result;
-    __asm volatile(".byte 15;.byte 49;shlq $32,%%rdx;orq %%rdx,%%rax"
-        : "=a" (result) ::  "%rdx");
-    return result;
-}
-#endif
 
 static void printfcomma(unsigned long long n) {
     if (n < 1000) {
@@ -234,6 +162,7 @@ static void display_result(double result, unsigned long long *l, size_t llen, un
 
 #define MEASURE(TEXT, MUL, FNCALL)\
     printf(TEXT);\
+    struct timespec start, stop;\
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);\
     for(i = 0; i < NTESTS; i++) {\
         t[i] = cpucycles();\
@@ -271,7 +200,6 @@ int main() {
     uint64_t keypair_cycles[TEST_ROUNDS] = {0};
     uint64_t sign_cycles[TEST_ROUNDS] = {0};
     uint64_t verify_cycles[TEST_ROUNDS] = {0};
-    struct timespec start, stop;
     double result;
     int i;
 
